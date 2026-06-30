@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Driver Behavior Analyzer</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --accent:#3fb950; --warn:#d29922; --bad:#f85149;
@@ -46,6 +48,25 @@
   .tab{flex:1; padding:8px; text-align:center; border-radius:8px; background:var(--panel); cursor:pointer; font-size:13px;}
   .tab.active{background:var(--accent); color:#04210d; font-weight:600;}
   .hidden{display:none;}
+  #liveMap{height:220px; border-radius:10px; margin-top:10px; z-index:1;}
+  .legend{display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; font-size:11px; color:var(--muted);}
+  .legend span{display:inline-flex; align-items:center; gap:4px;}
+  .dot{width:9px; height:9px; border-radius:50%; display:inline-block;}
+  .routeBtn{
+    width:auto; display:inline-block; padding:6px 10px; font-size:11px;
+    background:#21262d; color:var(--text); margin-top:0;
+  }
+  .modal{
+    position:fixed; top:0; left:0; right:0; bottom:0; background:#000000cc;
+    display:flex; align-items:center; justify-content:center; z-index:999; padding:16px;
+  }
+  .modal.hidden{display:none;}
+  .modal-content{
+    background:var(--panel); border-radius:14px; padding:14px; width:100%; max-width:480px;
+  }
+  .modal-content h3{margin:0 0 8px; font-size:15px;}
+  #historyMap{height:320px; border-radius:10px;}
+  .closeModal{background:#21262d; color:var(--text); margin-top:10px;}
 </style>
 </head>
 <body>
@@ -71,6 +92,13 @@
       <div class="stat"><div class="v" id="curSpeed">0</div><div class="l">km/jam</div></div>
       <div class="stat"><div class="v" id="smoothScore">100</div><div class="l">Smooth Score</div></div>
       <div class="stat"><div class="v" id="evtCount">0</div><div class="l">Events</div></div>
+    </div>
+    <div id="liveMap"></div>
+    <div class="legend">
+      <span><span class="dot" style="background:#3fb950"></span>Rute</span>
+      <span><span class="dot" style="background:#f85149"></span>Rem mendadak</span>
+      <span><span class="dot" style="background:#d29922"></span>Gas mendadak</span>
+      <span><span class="dot" style="background:#e3b341"></span>Zigzag</span>
     </div>
   </div>
 
@@ -112,6 +140,21 @@
   <button onclick="resetData()" style="background:#7a2e26;color:#fff;">🗑 Reset Semua Data</button>
 </div>
 
+<!-- HISTORY MAP MODAL -->
+<div class="modal hidden" id="historyModal">
+  <div class="modal-content">
+    <h3 id="historyModalTitle">Rute Shift</h3>
+    <div id="historyMap"></div>
+    <div class="legend">
+      <span><span class="dot" style="background:#3fb950"></span>Rute</span>
+      <span><span class="dot" style="background:#f85149"></span>Rem mendadak</span>
+      <span><span class="dot" style="background:#d29922"></span>Gas mendadak</span>
+      <span><span class="dot" style="background:#e3b341"></span>Zigzag</span>
+    </div>
+    <button class="closeModal" onclick="closeHistoryMap()">Tutup</button>
+  </div>
+</div>
+
 <script>
 /* ====== STATE ====== */
 let watchId = null;
@@ -119,6 +162,10 @@ let lastSpeed = null, lastTime = null, lastHeading = null;
 let sessionEvents = [];
 let sessionStart = null;
 let smoothScore = 100;
+let routeCoords = []; // {lat,lng,t}
+
+let liveMap=null, liveLine=null, liveMarkers=[];
+let historyMap=null;
 
 const STORAGE_KEY = 'driverBehaviorData_v1';
 
@@ -143,6 +190,10 @@ function startTracking(){
   sessionStart = Date.now();
   smoothScore = 100;
   lastSpeed=null; lastTime=null; lastHeading=null;
+  routeCoords = [];
+  liveMarkers = [];
+
+  initLiveMap();
 
   watchId = navigator.geolocation.watchPosition(onPosition, onError, {
     enableHighAccuracy:true, maximumAge:0, timeout:5000
@@ -151,6 +202,16 @@ function startTracking(){
   document.getElementById('startBtn').classList.add('hidden');
   document.getElementById('stopBtn').classList.remove('hidden');
   document.getElementById('statusText').textContent = 'Status: tracking aktif...';
+}
+
+function initLiveMap(){
+  const mapEl = document.getElementById('liveMap');
+  if(liveMap){ liveMap.remove(); }
+  liveMap = L.map(mapEl).setView([-7.7956, 110.3695], 15); // default Jogja
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors', maxZoom:19
+  }).addTo(liveMap);
+  liveLine = L.polyline([], {color:'#3fb950', weight:4}).addTo(liveMap);
 }
 
 function stopTracking(){
@@ -170,6 +231,13 @@ function onPosition(pos){
   const t = pos.timestamp/1000;
   const speed = pos.coords.speed; // m/s, null jika tak tersedia
   const heading = pos.coords.heading; // derajat
+  const lat = pos.coords.latitude, lng = pos.coords.longitude;
+
+  routeCoords.push({lat, lng, t});
+  if(liveMap){
+    liveLine.addLatLng([lat,lng]);
+    liveMap.setView([lat,lng], liveMap.getZoom()<3?16:liveMap.getZoom());
+  }
 
   const kmh = speed!=null ? (speed*3.6) : null;
   if(kmh!=null) document.getElementById('curSpeed').textContent = kmh.toFixed(0);
@@ -178,7 +246,7 @@ function onPosition(pos){
     const dt = t - lastTime;
     if(dt>0.3 && dt<5){
       const accel = (speed - lastSpeed)/dt; // m/s^2
-      classifyAccel(accel, t);
+      classifyAccel(accel, t, lat, lng);
     }
   }
 
@@ -189,7 +257,7 @@ function onPosition(pos){
       if(diff>180) diff = 360-diff;
       const rate = diff/dt;
       if(rate > ZIGZAG_DEG_PER_SEC && kmh>10){
-        logEvent('zigzag', t, 'Belokan tajam berulang ('+rate.toFixed(0)+'°/s)');
+        logEvent('zigzag', t, 'Belokan tajam berulang ('+rate.toFixed(0)+'°/s)', lat, lng);
         updateTag('zigTag','zigzag','Zigzag');
         smoothScore = Math.max(0, smoothScore-2);
       }
@@ -201,13 +269,13 @@ function onPosition(pos){
   document.getElementById('evtCount').textContent = sessionEvents.length;
 }
 
-function classifyAccel(accel, t){
+function classifyAccel(accel, t, lat, lng){
   if(accel >= HARSH_ACCEL){
-    logEvent('harsh_gas', t, 'Akselerasi mendadak ('+accel.toFixed(1)+' m/s²)');
+    logEvent('harsh_gas', t, 'Akselerasi mendadak ('+accel.toFixed(1)+' m/s²)', lat, lng);
     updateTag('gasTag','harsh','Kasar / Mendadak');
     smoothScore = Math.max(0, smoothScore-3);
   } else if(accel <= HARSH_BRAKE){
-    logEvent('harsh_brake', t, 'Rem mendadak ('+accel.toFixed(1)+' m/s²)');
+    logEvent('harsh_brake', t, 'Rem mendadak ('+accel.toFixed(1)+' m/s²)', lat, lng);
     updateTag('remTag','harsh','Kasar / Mendadak');
     smoothScore = Math.max(0, smoothScore-3);
   } else if(Math.abs(accel) < 1.0){
@@ -222,13 +290,22 @@ function updateTag(id, cls, text){
   el.textContent = text;
 }
 
-function logEvent(type, t, desc){
-  sessionEvents.push({type, t, desc, hour: new Date(t*1000).getHours()});
+const EVENT_COLOR = {harsh_brake:'#f85149', harsh_gas:'#d29922', zigzag:'#e3b341'};
+
+function logEvent(type, t, desc, lat, lng){
+  sessionEvents.push({type, t, desc, lat, lng, hour: new Date(t*1000).getHours()});
   const logEl = document.getElementById('eventLog');
   const div = document.createElement('div');
   const time = new Date(t*1000).toLocaleTimeString();
   div.textContent = '['+time+'] '+desc;
   logEl.prepend(div);
+
+  if(liveMap && lat!=null && lng!=null){
+    const marker = L.circleMarker([lat,lng], {
+      radius:7, color:EVENT_COLOR[type]||'#fff', fillColor:EVENT_COLOR[type]||'#fff', fillOpacity:0.9
+    }).bindPopup(desc).addTo(liveMap);
+    liveMarkers.push(marker);
+  }
 }
 
 /* ====== PERSISTENCE / WEEKLY AGGREGATION ====== */
@@ -236,6 +313,12 @@ function loadData(){
   try{
     return JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
   }catch(e){ return []; }
+}
+
+function simplifyRoute(coords, maxPoints){
+  if(coords.length<=maxPoints) return coords;
+  const step = Math.ceil(coords.length/maxPoints);
+  return coords.filter((_,i)=> i%step===0);
 }
 
 function saveSession(){
@@ -250,11 +333,19 @@ function saveSession(){
     harshGas: sessionEvents.filter(e=>e.type==='harsh_gas').length,
     zigzag: sessionEvents.filter(e=>e.type==='zigzag').length,
     score: smoothScore,
-    hourly: sessionEvents.reduce((acc,e)=>{acc[e.hour]=(acc[e.hour]||0)+1; return acc;},{})
+    hourly: sessionEvents.reduce((acc,e)=>{acc[e.hour]=(acc[e.hour]||0)+1; return acc;},{}),
+    route: simplifyRoute(routeCoords, 400).map(c=>[c.lat,c.lng]),
+    events: sessionEvents.map(e=>({type:e.type, desc:e.desc, lat:e.lat, lng:e.lng}))
   });
   // keep last 30 sessions
   while(data.length>30) data.shift();
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  try{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }catch(e){
+    // storage penuh -> buang sesi paling lama lalu coba lagi
+    data.shift();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }
 }
 
 function resetData(){
@@ -271,7 +362,8 @@ function renderWeekly(){
   if(data.length===0){
     tbody.innerHTML = '<tr><td colspan="6" class="small">Belum ada data shift tersimpan.</td></tr>';
   }
-  data.slice().reverse().forEach(s=>{
+  data.slice().reverse().forEach((s, idxRev)=>{
+    const realIdx = data.length-1-idxRev; // index asli di array data
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${s.day}<br><span class="small">${s.date}</span></td>
       <td>${s.durationHrs.toFixed(1)}j</td>
@@ -280,6 +372,19 @@ function renderWeekly(){
       <td>${s.zigzag}</td>
       <td style="color:${s.score>80?'#3fb950':s.score>60?'#d29922':'#f85149'}">${s.score.toFixed(0)}</td>`;
     tbody.appendChild(tr);
+    if(s.route && s.route.length>1){
+      const trBtn = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.style.paddingBottom = '10px';
+      const btn = document.createElement('button');
+      btn.className = 'routeBtn';
+      btn.textContent = '🗺 Lihat Rute Shift Ini';
+      btn.onclick = ()=>showHistoryMap(realIdx);
+      td.appendChild(btn);
+      trBtn.appendChild(td);
+      tbody.appendChild(trBtn);
+    }
   });
 
   // hourly aggregation across all sessions
@@ -321,6 +426,38 @@ function renderWeekly(){
 }
 
 renderWeekly();
+
+function showHistoryMap(sessionIdx){
+  const data = loadData();
+  const s = data[sessionIdx];
+  if(!s || !s.route || s.route.length===0){ alert('Tidak ada data rute untuk shift ini.'); return; }
+
+  document.getElementById('historyModalTitle').textContent = 'Rute Shift - '+s.day+' ('+s.date+')';
+  document.getElementById('historyModal').classList.remove('hidden');
+
+  setTimeout(()=>{
+    if(historyMap){ historyMap.remove(); historyMap=null; }
+    historyMap = L.map('historyMap');
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors', maxZoom:19
+    }).addTo(historyMap);
+
+    const line = L.polyline(s.route, {color:'#3fb950', weight:4}).addTo(historyMap);
+    historyMap.fitBounds(line.getBounds(), {padding:[20,20]});
+
+    (s.events||[]).forEach(e=>{
+      if(e.lat==null || e.lng==null) return;
+      L.circleMarker([e.lat,e.lng], {
+        radius:7, color:EVENT_COLOR[e.type]||'#fff', fillColor:EVENT_COLOR[e.type]||'#fff', fillOpacity:0.9
+      }).bindPopup(e.desc).addTo(historyMap);
+    });
+  }, 50);
+}
+
+function closeHistoryMap(){
+  document.getElementById('historyModal').classList.add('hidden');
+  if(historyMap){ historyMap.remove(); historyMap=null; }
+}
 </script>
 </body>
 </html>
